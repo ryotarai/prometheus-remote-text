@@ -1,14 +1,14 @@
 package main
 
 import (
-	"fmt"
+	"encoding/json"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/snappy"
@@ -16,9 +16,16 @@ import (
 )
 
 type Server struct {
-	path   string
-	writer io.WriteCloser
-	mutex  sync.Mutex
+	path               string
+	data               io.WriteCloser
+	mutex              sync.Mutex
+	processingRequests int64
+}
+
+type sampleRecord struct {
+	Timestamp int64             `json:"timestamp"`
+	Value     float64           `json:"value"`
+	Labels    map[string]string `json:"labels"`
 }
 
 func NewServer(path string) (*Server, error) {
@@ -53,7 +60,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	atomic.AddInt64(&s.processingRequests, 1)
+	log.Printf("Writing %d timeseries... (Processing requests: %d)", len(req.Timeseries), s.processingRequests)
 	s.writeTimeseries(req.Timeseries)
+	atomic.AddInt64(&s.processingRequests, -1)
 }
 
 func (s *Server) writeTimeseries(tss []*prompb.TimeSeries) error {
@@ -62,16 +72,19 @@ func (s *Server) writeTimeseries(tss []*prompb.TimeSeries) error {
 
 	for _, ts := range tss {
 		for _, sample := range ts.Samples {
-			fields := []string{
-				fmt.Sprintf("timestamp:%d", sample.Timestamp),
-				fmt.Sprintf("value:%f", sample.Value),
-			}
+			r := sampleRecord{}
+			r.Timestamp = sample.Timestamp
+			r.Value = sample.Value
+			r.Labels = map[string]string{}
 			for _, l := range ts.Labels {
-				name := strings.Replace(l.Name, ":", "__comma__", -1)
-				fields = append(fields, fmt.Sprintf("%s:%s", name, l.Value))
+				r.Labels[l.Name] = l.Value
 			}
 
-			fmt.Fprintln(s.writer, strings.Join(fields, "\t"))
+			j := json.NewEncoder(s.data)
+			err := j.Encode(r)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -81,8 +94,8 @@ func (s *Server) OpenFile() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if s.writer != nil {
-		err := s.writer.Close()
+	if s.data != nil {
+		err := s.data.Close()
 		if err != nil {
 			log.Printf("Closing a opened file failed: %s", err)
 		}
@@ -93,7 +106,7 @@ func (s *Server) OpenFile() error {
 	if err != nil {
 		return err
 	}
-	s.writer = f
+	s.data = f
 	return nil
 }
 
