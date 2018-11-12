@@ -20,6 +20,9 @@ type Server struct {
 	data               io.WriteCloser
 	mutex              sync.Mutex
 	processingRequests int64
+	triggerFile        *TriggerFile
+
+	ReopenTriggerPath string
 }
 
 type sampleRecord struct {
@@ -28,14 +31,22 @@ type sampleRecord struct {
 	Labels    map[string]string `json:"labels"`
 }
 
-func NewServer(path string) (*Server, error) {
+func NewServer(path string, triggerFilePath string) (*Server, error) {
 	s := &Server{
 		path:  path,
 		mutex: sync.Mutex{},
 	}
-	err := s.OpenFile()
+
+	err := s.ReopenFile()
 	if err != nil {
 		return nil, err
+	}
+
+	if triggerFilePath != "" {
+		s.triggerFile, err = NewTriggerFile(triggerFilePath)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return s, nil
@@ -67,6 +78,11 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) writeTimeseries(tss []*prompb.TimeSeries) error {
+	err := s.reopenFileIfTriggered()
+	if err != nil {
+		return err
+	}
+
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
@@ -90,7 +106,24 @@ func (s *Server) writeTimeseries(tss []*prompb.TimeSeries) error {
 	return nil
 }
 
-func (s *Server) OpenFile() error {
+func (s *Server) reopenFileIfTriggered() error {
+	if s.triggerFile != nil {
+		touched, err := s.triggerFile.CheckIfTouched()
+		if err != nil {
+			return err
+		}
+
+		if touched {
+			err = s.ReopenFile()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Server) ReopenFile() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
